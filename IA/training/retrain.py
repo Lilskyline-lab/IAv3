@@ -1,6 +1,7 @@
 """
 Script de réentraînement progressif avec diagnostic
 Augmente graduellement la complexité et les données
+LANCE AUTOMATIQUEMENT L'ENTRAÎNEMENT
 """
 
 import os
@@ -157,7 +158,7 @@ def progressive_training(trainer, phase):
 
 def main():
     print("\n" + "="*70)
-    print("🔄 RÉENTRAÎNEMENT PROGRESSIF")
+    print("🔄 RÉENTRAÎNEMENT PROGRESSIF AUTOMATIQUE")
     print("="*70)
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -171,7 +172,11 @@ def main():
     
     tokenizer_name = "mistralai/Mistral-7B-v0.1"
     
+    print(f"📁 Model directory: {model_dir}")
+    print(f"🔤 Tokenizer: {tokenizer_name}")
+    
     # Créer le trainer
+    print("\n⏳ Initialisation du trainer...")
     trainer = OASSTTrainer(
         model_dir=model_dir,
         tokenizer_name=tokenizer_name,
@@ -192,9 +197,9 @@ def main():
     ]
     test_generation(trainer, test_prompts)
     
-    # Demander confirmation
+    # Déterminer les phases automatiquement
     print("\n" + "="*70)
-    print("🤔 PLAN D'ENTRAÎNEMENT RECOMMANDÉ:")
+    print("🤔 PLAN D'ENTRAÎNEMENT DÉTECTÉ:")
     print("="*70)
     
     if recommendation == "train_more":
@@ -217,16 +222,25 @@ def main():
     
     else:
         print("✅ Modèle déjà bien entraîné!")
-        print("💡 Vous pouvez faire du fine-tuning additionnel si nécessaire")
+        print("💡 Aucun entraînement supplémentaire nécessaire")
+        print("\n🎉 Le modèle est prêt à l'emploi!")
+        print("\n💡 Testez-le avec:")
+        print("   python test.py --mode interactive --template mistral")
         phases = []
     
     if phases:
         print(f"\n⏱️  Temps estimé: {len(phases) * 30}-{len(phases) * 60} minutes")
         print("="*70)
+        print("\n🚀 DÉMARRAGE AUTOMATIQUE DE L'ENTRAÎNEMENT...")
+        print("   (Pour annuler: Ctrl+C)")
+        print("="*70)
         
-        response = input("\n🚀 Lancer l'entraînement progressif? (y/N): ")
+        import time
+        print("\n⏳ Démarrage dans 3 secondes...")
+        time.sleep(3)
         
-        if response.lower() == 'y':
+        # LANCEMENT AUTOMATIQUE
+        try:
             for i, phase in enumerate(phases, 1):
                 print(f"\n{'='*70}")
                 print(f"🎯 ÉTAPE {i}/{len(phases)}")
@@ -246,10 +260,28 @@ def main():
             print("\n📊 TEST FINAL:")
             test_generation(trainer, test_prompts)
             
+            print("\n" + "="*70)
+            print("✅ SUCCÈS! Le modèle est maintenant entraîné")
+            print("="*70)
+            print(f"📊 Statistiques finales:")
+            print(f"   - Cycles: {len(trainer.history['cycles'])}")
+            print(f"   - Total exemples: {trainer.history['total_examples_trained']}")
+            print(f"   - DPO cycles: {trainer.history['dpo_cycles']}")
             print("\n💡 Testez en mode interactif avec:")
             print("   python test.py --mode interactive --template mistral")
-        else:
-            print("\n❌ Entraînement annulé")
+            print("\n📝 Ou testez un prompt unique:")
+            print('   python test.py --mode single --prompt "Hello!" --template mistral')
+            print("="*70)
+            
+        except KeyboardInterrupt:
+            print("\n\n⚠️  ENTRAÎNEMENT INTERROMPU PAR L'UTILISATEUR")
+            print("💾 Le modèle a été sauvegardé au dernier checkpoint")
+            print("   Relancez le script pour continuer l'entraînement")
+        except Exception as e:
+            print(f"\n\n❌ ERREUR DURANT L'ENTRAÎNEMENT: {e}")
+            import traceback
+            traceback.print_exc()
+            print("\n💾 Le modèle a été sauvegardé au dernier checkpoint")
     
     print("\n" + "="*70)
 
