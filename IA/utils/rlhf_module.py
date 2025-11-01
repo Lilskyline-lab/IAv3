@@ -1,141 +1,114 @@
-
 """
-Module RLHF (Reinforcement Learning from Human Feedback) pour GAMA-AI
-Compatible avec LoRAFineTuning.py et utilise le dataset Anthropic/hh-rlhf
+Module DPO (Direct Preference Optimization) - Alternative moderne au RLHF/PPO
+Plus simple, plus stable, et tout aussi efficace que PPO pour l'alignment
 
-Installation requise:
-pip install transformers datasets trl accelerate
+DPO élimine le besoin d'un reward model séparé et utilise directement
+les préférences humaines pour optimiser la policy.
 
-Usage:
-    from utils.rlhf_module import RLHFTrainer, RLHFConfig
-    
-    # Après un training LoRA classique
-    rlhf_config = RLHFConfig()
-    rlhf_trainer = RLHFTrainer(
-        model_dir="./saved_models/my_llm",
-        tokenizer_path="./Tokenizer/tokenizer_5k.bin",
-        device=torch.device("cuda"),
-        rlhf_config=rlhf_config
-    )
-    rlhf_trainer.train_with_rlhf()
+Paper: "Direct Preference Optimization: Your Language Model is Secretly a Reward Model"
+https://arxiv.org/abs/2305.18290
+
+Installation:
+    pip install datasets transformers torch tqdm
 """
 
 import os
 import sys
 import json
-import time
 import logging
 from typing import List, Dict, Optional, Tuple
 from pathlib import Path
 from dataclasses import dataclass, field, asdict
 from tqdm import tqdm
+import copy
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.utils.data import Dataset, DataLoader
 
-# Imports pour RLHF
 try:
     from datasets import load_dataset
     HF_DATASETS_AVAILABLE = True
 except ImportError:
     HF_DATASETS_AVAILABLE = False
-    print("⚠️  datasets non disponible. Installez avec: pip install datasets")
-
-try:
-    from trl import PPOTrainer, PPOConfig, AutoModelForCausalLMWithValueHead
-    from trl import create_reference_model
-    TRL_AVAILABLE = True
-except ImportError:
-    TRL_AVAILABLE = False
-    print("⚠️  TRL non disponible. Installez avec: pip install trl")
+    print("⚠️  datasets non disponible. Installez: pip install datasets")
 
 
 # ============================================================================
-# CONFIGURATION RLHF
+# CONFIGURATION DPO
 # ============================================================================
 
 @dataclass
-class RLHFConfig:
-    """Configuration pour l'entraînement RLHF"""
+class DPOConfig:
+    """Configuration pour DPO (Direct Preference Optimization)"""
     
-    # Dataset Anthropic
+    # Dataset
     dataset_name: str = "Anthropic/hh-rlhf"
-    dataset_subset: Optional[str] = None
     max_samples_train: int = 10000
     max_samples_val: int = 1000
+    max_prompt_length: int = 256
+    max_response_length: int = 256
     
-    # PPO (Proximal Policy Optimization)
-    learning_rate: float = 1.41e-5
-    batch_size: int = 8
-    mini_batch_size: int = 2
+    # DPO Hyperparameters
+    beta: float = 0.1  # Coefficient de régularisation KL (très important!)
+    learning_rate: float = 5e-7  # LR plus petit pour stability
+    num_epochs: int = 1
+    batch_size: int = 4
     gradient_accumulation_steps: int = 4
-    ppo_epochs: int = 4
     
-    # Génération
-    max_new_tokens: int = 256
-    temperature: float = 0.7
-    top_p: float = 0.9
-    top_k: int = 50
+    # Optimization
+    max_grad_norm: float = 1.0
+    weight_decay: float = 0.01
+    warmup_steps: int = 100
     
-    # KL divergence (évite que le modèle s'éloigne trop du modèle de référence)
-    init_kl_coef: float = 0.2
-    target_kl: float = 0.1
-    kl_penalty: str = "kl"
-    
-    # Récompenses
-    reward_scale: float = 1.0
-    reward_baseline: float = 0.0
-    use_length_penalty: bool = True
-    length_penalty_coef: float = 0.05
-    
-    # Training
-    num_train_epochs: int = 1
-    max_grad_norm: float = 0.5
-    
-    # Logging et sauvegarde
+    # Logging & Saving
     logging_steps: int = 10
-    save_steps: int = 500
     eval_steps: int = 250
-    output_dir: str = "./rlhf_output"
+    save_steps: int = 500
+    output_dir: str = "./dpo_output"
     
     # Advanced
-    use_score_scaling: bool = True
-    use_score_norm: bool = True
-    cliprange: float = 0.2
-    cliprange_value: float = 0.2
-    vf_coef: float = 0.1
-    adap_kl_ctrl: bool = True
+    label_smoothing: float = 0.0  # Label smoothing pour stability
+    use_weighting: bool = False  # Pondérer les exemples par leur margin
 
 
 # ============================================================================
-# DATASET RLHF
+# DATASET POUR DPO
 # ============================================================================
 
-class AnthropicRLHFDataset(Dataset):
+class DPODataset(Dataset):
     """
-    Dataset pour Anthropic/hh-rlhf
-    Extrait les paires (chosen, rejected) et prépare les prompts
+    Dataset pour DPO avec paires (chosen, rejected)
+    
+    Format attendu pour chaque exemple:
+    {
+        'prompt': "...",
+        'chosen': "...",
+        'rejected': "..."
+    }
     """
     
     def __init__(
-        self, 
+        self,
         split: str = "train",
         max_samples: Optional[int] = None,
         tokenizer = None,
-        max_length: int = 512
+        max_prompt_length: int = 256,
+        max_response_length: int = 256
     ):
         self.split = split
         self.tokenizer = tokenizer
-        self.max_length = max_length
+        self.max_prompt_length = max_prompt_length
+        self.max_response_length = max_response_length
         
         if not HF_DATASETS_AVAILABLE:
-            raise ImportError("datasets non disponible! Installez avec: pip install datasets")
+            raise ImportError("datasets non disponible!")
         
         print(f"📥 Chargement Anthropic/hh-rlhf ({split})...")
         
-        # Charger le dataset
+        # Charger dataset
         if max_samples:
             dataset = load_dataset("Anthropic/hh-rlhf", split=f"{split}[:{max_samples}]")
         else:
@@ -149,12 +122,15 @@ class AnthropicRLHFDataset(Dataset):
             if parsed:
                 self.data.append(parsed)
         
-        print(f"✅ {len(self.data)} exemples chargés")
+        print(f"✅ {len(self.data)} paires chargées")
     
     def _parse_conversation(self, item: Dict) -> Optional[Dict]:
         """
-        Parse une conversation du format Anthropic
-        Format: "Human: ... Assistant: ... Human: ... Assistant: ..."
+        Parse format Anthropic/hh-rlhf
+        
+        Format original:
+        chosen: "Human: ... Assistant: ... Human: ... Assistant: GOOD_RESPONSE"
+        rejected: "Human: ... Assistant: ... Human: ... Assistant: BAD_RESPONSE"
         """
         chosen = item.get('chosen', '')
         rejected = item.get('rejected', '')
@@ -162,25 +138,36 @@ class AnthropicRLHFDataset(Dataset):
         if not chosen or not rejected:
             return None
         
-        # Split par "Assistant:"
+        # Split sur "\n\nAssistant:"
         chosen_parts = chosen.split('\n\nAssistant:')
-        if len(chosen_parts) < 2:
+        rejected_parts = rejected.split('\n\nAssistant:')
+        
+        if len(chosen_parts) < 2 or len(rejected_parts) < 2:
             return None
         
-        # Le prompt est tout sauf la dernière réponse
-        prompt = '\n\nAssistant:'.join(chosen_parts[:-1]) + '\n\nAssistant:'
+        # Prompt = tout sauf la dernière réponse
+        prompt_chosen = '\n\nAssistant:'.join(chosen_parts[:-1])
+        prompt_rejected = '\n\nAssistant:'.join(rejected_parts[:-1])
         
-        # Les réponses
+        # Vérifier que les prompts sont identiques
+        if prompt_chosen != prompt_rejected:
+            # Prendre le prompt le plus court (plus safe)
+            prompt = min(prompt_chosen, prompt_rejected, key=len)
+        else:
+            prompt = prompt_chosen
+        
+        # Extraire les réponses
         chosen_response = chosen_parts[-1].strip()
-        
-        rejected_parts = rejected.split('\n\nAssistant:')
-        rejected_response = rejected_parts[-1].strip() if len(rejected_parts) >= 2 else ""
+        rejected_response = rejected_parts[-1].strip()
         
         if not chosen_response or not rejected_response:
             return None
         
+        # Ajouter "Assistant:" au début pour cohérence
+        prompt = prompt + '\n\nAssistant:'
+        
         return {
-            'query': prompt,
+            'prompt': prompt,
             'chosen': chosen_response,
             'rejected': rejected_response
         }
@@ -189,318 +176,481 @@ class AnthropicRLHFDataset(Dataset):
         return len(self.data)
     
     def __getitem__(self, idx: int) -> Dict:
-        return self.data[idx]
+        item = self.data[idx]
+        
+        # Tokenize
+        prompt_ids = self.tokenizer.encoder(item['prompt'])
+        chosen_ids = self.tokenizer.encoder(item['chosen'])
+        rejected_ids = self.tokenizer.encoder(item['rejected'])
+        
+        # Tronquer si nécessaire
+        prompt_ids = prompt_ids[-self.max_prompt_length:]
+        chosen_ids = chosen_ids[:self.max_response_length]
+        rejected_ids = rejected_ids[:self.max_response_length]
+        
+        return {
+            'prompt_ids': prompt_ids,
+            'chosen_ids': chosen_ids,
+            'rejected_ids': rejected_ids,
+            'prompt_text': item['prompt'],
+            'chosen_text': item['chosen'],
+            'rejected_text': item['rejected']
+        }
 
 
-# ============================================================================
-# MODÈLE DE RÉCOMPENSE
-# ============================================================================
-
-class RewardModel:
-    """
-    Modèle de récompense basé sur les préférences humaines
-    Utilise les paires (chosen, rejected) pour apprendre à scorer les réponses
-    """
+def dpo_collate_fn(batch: List[Dict], pad_id: int = 0) -> Dict:
+    """Collate function pour DPO"""
     
-    def __init__(self, use_heuristics: bool = True):
-        self.use_heuristics = use_heuristics
-        self.logger = logging.getLogger("RewardModel")
+    # Séparer les composants
+    prompt_ids = [item['prompt_ids'] for item in batch]
+    chosen_ids = [item['chosen_ids'] for item in batch]
+    rejected_ids = [item['rejected_ids'] for item in batch]
     
-    def compute_rewards(
-        self,
-        queries: List[str],
-        responses: List[str],
-        tokenizer = None
-    ) -> List[float]:
-        """
-        Calcule les récompenses pour chaque réponse
+    # Padding
+    max_prompt_len = max(len(ids) for ids in prompt_ids)
+    max_chosen_len = max(len(ids) for ids in chosen_ids)
+    max_rejected_len = max(len(ids) for ids in rejected_ids)
+    
+    # Tensors pour chosen
+    prompt_chosen_ids = []
+    chosen_labels = []
+    
+    for p_ids, c_ids in zip(prompt_ids, chosen_ids):
+        # Concaténer prompt + chosen
+        full_ids = p_ids + c_ids
         
-        Heuristiques utilisées:
-        1. Longueur raisonnable (ni trop court ni trop long)
-        2. Diversité du vocabulaire
-        3. Absence de répétitions
-        4. Présence de ponctuation appropriée
-        5. Cohérence (pas de tokens spéciaux visibles)
-        """
-        rewards = []
+        # Padding
+        pad_len = (max_prompt_len + max_chosen_len) - len(full_ids)
+        padded = full_ids + [pad_id] * pad_len
         
-        for query, response in zip(queries, responses):
-            reward = 0.0
-            
-            # 1. Longueur (optimal entre 50-300 caractères)
-            length = len(response)
-            if 50 <= length <= 300:
-                reward += 1.0
-            elif 30 <= length < 50 or 300 < length <= 500:
-                reward += 0.5
-            else:
-                reward -= 0.5
-            
-            # 2. Diversité du vocabulaire
-            words = response.split()
-            if len(words) > 0:
-                unique_ratio = len(set(words)) / len(words)
-                reward += unique_ratio * 0.5
-            
-            # 3. Pas de répétitions excessives
-            if len(words) >= 3:
-                trigrams = [' '.join(words[i:i+3]) for i in range(len(words)-2)]
-                if len(trigrams) > 0:
-                    repetition_ratio = 1.0 - (len(set(trigrams)) / len(trigrams))
-                    reward -= repetition_ratio * 1.0
-            
-            # 4. Ponctuation appropriée
-            has_period = '.' in response or '!' in response or '?' in response
-            if has_period:
-                reward += 0.3
-            
-            # 5. Pas de tokens spéciaux visibles
-            special_tokens = ['<pad>', '<unk>', '<s>', '</s>', '[PAD]', '[UNK]']
-            if not any(token in response for token in special_tokens):
-                reward += 0.2
-            
-            # 6. Cohérence avec la query
-            if response.strip() != query.strip():
-                reward += 0.3
-            
-            rewards.append(reward)
+        # Labels: -100 pour le prompt, vrai IDs pour chosen
+        labels = [-100] * len(p_ids) + c_ids + [-100] * pad_len
         
-        return rewards
+        prompt_chosen_ids.append(padded)
+        chosen_labels.append(labels)
+    
+    # Tensors pour rejected
+    prompt_rejected_ids = []
+    rejected_labels = []
+    
+    for p_ids, r_ids in zip(prompt_ids, rejected_ids):
+        full_ids = p_ids + r_ids
+        pad_len = (max_prompt_len + max_rejected_len) - len(full_ids)
+        padded = full_ids + [pad_id] * pad_len
+        labels = [-100] * len(p_ids) + r_ids + [-100] * pad_len
+        
+        prompt_rejected_ids.append(padded)
+        rejected_labels.append(labels)
+    
+    return {
+        'chosen_input_ids': torch.tensor(prompt_chosen_ids, dtype=torch.long),
+        'chosen_labels': torch.tensor(chosen_labels, dtype=torch.long),
+        'rejected_input_ids': torch.tensor(prompt_rejected_ids, dtype=torch.long),
+        'rejected_labels': torch.tensor(rejected_labels, dtype=torch.long)
+    }
 
 
 # ============================================================================
-# TRAINER RLHF PRINCIPAL
+# DPO TRAINER
 # ============================================================================
 
-class RLHFTrainer:
+class DPOTrainer:
     """
-    Trainer RLHF principal compatible avec GAMA-AI
+    Trainer DPO (Direct Preference Optimization)
+    
+    DPO optimise directement la policy en utilisant les préférences,
+    sans besoin d'un reward model séparé.
+    
+    Loss DPO:
+    L = -log(σ(β * [log π_θ(y_w|x) - log π_ref(y_w|x) 
+                     - log π_θ(y_l|x) + log π_ref(y_l|x)]))
+    
+    Où:
+    - y_w = chosen response
+    - y_l = rejected response
+    - π_θ = policy model
+    - π_ref = reference model (frozen)
+    - β = regularization coefficient
+    - σ = sigmoid
     """
     
     def __init__(
         self,
-        base_model,
+        model,  # Policy model (sera optimisé)
         tokenizer,
         device: torch.device,
-        rlhf_config: RLHFConfig,
+        config: DPOConfig,
         model_dir: Optional[str] = None
     ):
-        """
-        Args:
-            base_model: Modèle HessGPT déjà entraîné
-            tokenizer: Tokenizer MYBPE
-            device: torch.device
-            rlhf_config: Configuration RLHF
-            model_dir: Répertoire du modèle (optionnel)
-        """
-        self.base_model = base_model
+        self.policy_model = model
         self.tokenizer = tokenizer
         self.device = device
-        self.config = rlhf_config
+        self.config = config
         self.model_dir = Path(model_dir) if model_dir else None
         
-        self.logger = logging.getLogger("RLHFTrainer")
+        # Créer reference model (frozen copy du policy)
+        print("📋 Création du reference model (copie figée)...")
+        self.ref_model = copy.deepcopy(model)
+        self.ref_model.eval()
+        for param in self.ref_model.parameters():
+            param.requires_grad = False
+        print("✅ Reference model créé et figé")
+        
+        # Logger
+        self.logger = logging.getLogger("DPOTrainer")
         self.logger.setLevel(logging.INFO)
         
-        # Modèle de récompense
-        self.reward_model = RewardModel(use_heuristics=True)
-        
-        # Créer le répertoire de sortie
+        # Output dir
         Path(self.config.output_dir).mkdir(parents=True, exist_ok=True)
         
-        self.logger.info("✅ RLHFTrainer initialisé")
+        # Métriques
+        self.train_stats = {
+            'loss': [],
+            'accuracy': [],  # % où chosen > rejected
+            'chosen_rewards': [],
+            'rejected_rewards': []
+        }
+        
+        print(f"✅ DPOTrainer initialisé (β={config.beta})")
     
-    def _prepare_datasets(self):
-        """Prépare les datasets train et validation"""
-        train_dataset = AnthropicRLHFDataset(
-            split="train",
-            max_samples=self.config.max_samples_train,
-            tokenizer=self.tokenizer,
-            max_length=512
+    def compute_log_probs(
+        self,
+        model,
+        input_ids: torch.Tensor,
+        labels: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Calcule log P(y|x) pour une séquence
+        
+        Returns:
+            Tensor de shape (batch_size,) avec log prob moyen par token
+        """
+        # Forward pass
+        logits, _ = model(input_ids)
+        
+        # Shift pour autoregressive
+        logits = logits[:, :-1, :].contiguous()
+        labels = labels[:, 1:].contiguous()
+        
+        # Log probs
+        log_probs = F.log_softmax(logits, dim=-1)
+        
+        # IMPORTANT: Masquer d'abord les -100 avant gather
+        mask = (labels != -100).float()
+        
+        # Remplacer -100 par 0 pour éviter l'erreur d'index
+        labels_masked = labels.clone()
+        labels_masked[labels == -100] = 0
+        
+        # Gather les log probs des tokens réels
+        selected_log_probs = log_probs.gather(
+            dim=-1,
+            index=labels_masked.unsqueeze(-1)
+        ).squeeze(-1)
+        
+        # Appliquer le masque
+        masked_log_probs = selected_log_probs * mask
+        seq_log_probs = masked_log_probs.sum(dim=-1) / mask.sum(dim=-1).clamp(min=1)
+        
+        return seq_log_probs
+    
+    def dpo_loss(
+        self,
+        policy_chosen_logps: torch.Tensor,
+        policy_rejected_logps: torch.Tensor,
+        ref_chosen_logps: torch.Tensor,
+        ref_rejected_logps: torch.Tensor
+    ) -> Tuple[torch.Tensor, Dict]:
+        """
+        Calcule la loss DPO
+        
+        Returns:
+            loss, metrics_dict
+        """
+        # Rewards implicites
+        policy_chosen_rewards = policy_chosen_logps - ref_chosen_logps
+        policy_rejected_rewards = policy_rejected_logps - ref_rejected_logps
+        
+        # Logits pour DPO
+        logits = self.config.beta * (policy_chosen_rewards - policy_rejected_rewards)
+        
+        # Loss: -log sigmoid(logits)
+        loss = -F.logsigmoid(logits).mean()
+        
+        # Métriques
+        with torch.no_grad():
+            accuracy = (logits > 0).float().mean().item()
+            chosen_rewards = policy_chosen_rewards.mean().item()
+            rejected_rewards = policy_rejected_rewards.mean().item()
+        
+        metrics = {
+            'accuracy': accuracy,
+            'chosen_rewards': chosen_rewards,
+            'rejected_rewards': rejected_rewards,
+            'reward_margin': chosen_rewards - rejected_rewards
+        }
+        
+        return loss, metrics
+    
+    def train_step(
+        self,
+        batch: Dict
+    ) -> Tuple[torch.Tensor, Dict]:
+        """Un step d'entraînement"""
+        
+        # Move to device
+        chosen_ids = batch['chosen_input_ids'].to(self.device)
+        chosen_labels = batch['chosen_labels'].to(self.device)
+        rejected_ids = batch['rejected_input_ids'].to(self.device)
+        rejected_labels = batch['rejected_labels'].to(self.device)
+        
+        # Policy log probs
+        policy_chosen_logps = self.compute_log_probs(
+            self.policy_model, chosen_ids, chosen_labels
+        )
+        policy_rejected_logps = self.compute_log_probs(
+            self.policy_model, rejected_ids, rejected_labels
         )
         
-        val_dataset = AnthropicRLHFDataset(
-            split="test",
-            max_samples=self.config.max_samples_val,
-            tokenizer=self.tokenizer,
-            max_length=512
+        # Reference log probs (no grad)
+        with torch.no_grad():
+            ref_chosen_logps = self.compute_log_probs(
+                self.ref_model, chosen_ids, chosen_labels
+            )
+            ref_rejected_logps = self.compute_log_probs(
+                self.ref_model, rejected_ids, rejected_labels
+            )
+        
+        # DPO loss
+        loss, metrics = self.dpo_loss(
+            policy_chosen_logps,
+            policy_rejected_logps,
+            ref_chosen_logps,
+            ref_rejected_logps
         )
         
-        return train_dataset, val_dataset
+        return loss, metrics
     
-    def train_with_rlhf(self):
-        """
-        Lance l'entraînement RLHF complet
-        """
+    def train(self):
+        """Lance l'entraînement DPO"""
         print("\n" + "="*70)
-        print("🎯 DÉMARRAGE ENTRAÎNEMENT RLHF")
+        print("🎯 DÉMARRAGE ENTRAÎNEMENT DPO")
         print("="*70)
         print(f"📊 Dataset: {self.config.dataset_name}")
-        print(f"💾 Sortie: {self.config.output_dir}")
-        print(f"🔧 PPO Epochs: {self.config.ppo_epochs}")
+        print(f"💾 Output: {self.config.output_dir}")
+        print(f"🔧 Beta (KL coef): {self.config.beta}")
         print(f"📦 Batch size: {self.config.batch_size}")
+        print(f"📚 Epochs: {self.config.num_epochs}")
         print("="*70 + "\n")
         
         # Préparer datasets
-        train_dataset, val_dataset = self._prepare_datasets()
+        print("📥 Chargement des datasets...")
+        train_dataset = DPODataset(
+            split="train",
+            max_samples=self.config.max_samples_train,
+            tokenizer=self.tokenizer,
+            max_prompt_length=self.config.max_prompt_length,
+            max_response_length=self.config.max_response_length
+        )
         
-        self.logger.info("🚀 Début de l'entraînement RLHF simplifié...")
+        val_dataset = DPODataset(
+            split="test",
+            max_samples=self.config.max_samples_val,
+            tokenizer=self.tokenizer,
+            max_prompt_length=self.config.max_prompt_length,
+            max_response_length=self.config.max_response_length
+        )
         
-        # Passer le modèle en mode train
-        self.base_model.train()
+        # DataLoaders
+        pad_id = getattr(self.tokenizer, 'pad_token_id', 0) or 0
+        
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=self.config.batch_size,
+            shuffle=True,
+            collate_fn=lambda b: dpo_collate_fn(b, pad_id=pad_id)
+        )
+        
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=self.config.batch_size,
+            shuffle=False,
+            collate_fn=lambda b: dpo_collate_fn(b, pad_id=pad_id)
+        )
         
         # Optimizer
         optimizer = AdamW(
-            self.base_model.parameters(),
-            lr=self.config.learning_rate
+            self.policy_model.parameters(),
+            lr=self.config.learning_rate,
+            weight_decay=self.config.weight_decay
         )
         
-        # Training loop simplifié
-        total_steps = 0
-        best_avg_reward = float('-inf')
+        # Training loop
+        self.policy_model.train()
+        global_step = 0
+        best_val_accuracy = 0.0
         
-        for epoch in range(self.config.num_train_epochs):
-            self.logger.info(f"📍 Epoch {epoch + 1}/{self.config.num_train_epochs}")
+        for epoch in range(self.config.num_epochs):
+            print(f"\n📍 Epoch {epoch + 1}/{self.config.num_epochs}")
             
-            epoch_rewards = []
             epoch_losses = []
+            epoch_accuracies = []
             
-            # DataLoader
-            dataloader = DataLoader(
-                train_dataset,
-                batch_size=self.config.batch_size,
-                shuffle=True,
-                collate_fn=lambda x: x
-            )
-            
-            pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}")
+            pbar = tqdm(train_loader, desc=f"Training Epoch {epoch+1}")
             
             for batch_idx, batch in enumerate(pbar):
-                queries = [item['query'] for item in batch]
+                # Forward & loss
+                loss, metrics = self.train_step(batch)
                 
-                # Tokenize queries
-                query_tensors = []
-                for query in queries:
-                    tokens = self.tokenizer.encoder(query)
-                    tensor = torch.tensor(tokens, dtype=torch.long).unsqueeze(0).to(self.device)
-                    query_tensors.append(tensor)
-                
-                # Générer réponses
-                response_tensors = []
-                with torch.no_grad():
-                    for query_tensor in query_tensors:
-                        # Génération simple
-                        current_seq = query_tensor
-                        for _ in range(min(self.config.max_new_tokens, 100)):
-                            logits, _ = self.base_model(current_seq)
-                            next_token_logits = logits[:, -1, :] / self.config.temperature
-                            probs = torch.softmax(next_token_logits, dim=-1)
-                            next_token = torch.multinomial(probs, num_samples=1)
-                            current_seq = torch.cat([current_seq, next_token], dim=1)
-                        response_tensors.append(current_seq[0, query_tensor.shape[1]:])
-                
-                # Décoder les réponses
-                responses = [
-                    self.tokenizer.decoder(resp.cpu().tolist())
-                    for resp in response_tensors
-                ]
-                
-                # Calculer les récompenses
-                rewards = self.reward_model.compute_rewards(queries, responses, self.tokenizer)
-                epoch_rewards.extend(rewards)
-                
-                # Mise à jour du modèle (policy gradient simplifié)
-                optimizer.zero_grad()
-                
-                loss = torch.tensor(0.0, device=self.device)
-                for query_tensor, response_tensor, reward in zip(query_tensors, response_tensors, rewards):
-                    # Concaténer query + response
-                    full_seq = torch.cat([query_tensor[0], response_tensor])
-                    
-                    if len(full_seq) > 512:
-                        full_seq = full_seq[-512:]
-                    
-                    # Forward pass
-                    logits, _ = self.base_model(full_seq.unsqueeze(0))
-                    
-                    # Loss: negative log likelihood weighted by reward
-                    log_probs = torch.log_softmax(logits[0, :-1], dim=-1)
-                    selected_log_probs = log_probs.gather(1, full_seq[1:].unsqueeze(-1)).squeeze(-1)
-                    
-                    # Récompense normalisée
-                    reward_tensor = torch.tensor(reward, device=self.device)
-                    policy_loss = -(selected_log_probs * reward_tensor).mean()
-                    
-                    loss += policy_loss
-                
-                loss = loss / len(batch)
-                epoch_losses.append(loss.item())
-                
+                # Backward
+                loss = loss / self.config.gradient_accumulation_steps
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.base_model.parameters(), self.config.max_grad_norm)
-                optimizer.step()
+                
+                # Gradient accumulation
+                if (batch_idx + 1) % self.config.gradient_accumulation_steps == 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        self.policy_model.parameters(),
+                        self.config.max_grad_norm
+                    )
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    global_step += 1
+                
+                # Stats
+                epoch_losses.append(loss.item() * self.config.gradient_accumulation_steps)
+                epoch_accuracies.append(metrics['accuracy'])
                 
                 # Logging
-                avg_reward = sum(rewards) / len(rewards) if rewards else 0.0
-                pbar.set_postfix({
-                    'loss': f'{loss.item():.4f}',
-                    'reward': f'{avg_reward:.3f}'
-                })
+                if global_step % self.config.logging_steps == 0:
+                    pbar.set_postfix({
+                        'loss': f"{loss.item():.4f}",
+                        'acc': f"{metrics['accuracy']:.2%}",
+                        'margin': f"{metrics['reward_margin']:.3f}"
+                    })
                 
-                total_steps += 1
+                # Eval
+                if global_step % self.config.eval_steps == 0:
+                    val_metrics = self._evaluate(val_loader)
+                    self.policy_model.train()
+                    
+                    if val_metrics['accuracy'] > best_val_accuracy:
+                        best_val_accuracy = val_metrics['accuracy']
+                        self._save_checkpoint(epoch, global_step, is_best=True)
                 
-                # Sauvegarde périodique
-                if total_steps % self.config.save_steps == 0:
-                    self._save_checkpoint(epoch, total_steps)
+                # Save
+                if global_step % self.config.save_steps == 0:
+                    self._save_checkpoint(epoch, global_step)
             
-            # Stats epoch
-            avg_epoch_reward = sum(epoch_rewards) / len(epoch_rewards) if epoch_rewards else 0.0
-            avg_epoch_loss = sum(epoch_losses) / len(epoch_losses) if epoch_losses else 0.0
+            # Epoch summary
+            avg_loss = sum(epoch_losses) / len(epoch_losses)
+            avg_acc = sum(epoch_accuracies) / len(epoch_accuracies)
             
-            self.logger.info(
-                f"Epoch {epoch+1}: "
-                f"Avg Reward={avg_epoch_reward:.4f}, "
-                f"Avg Loss={avg_epoch_loss:.4f}"
-            )
-            
-            # Sauvegarde si meilleure récompense
-            if avg_epoch_reward > best_avg_reward:
-                best_avg_reward = avg_epoch_reward
-                self._save_checkpoint(epoch, total_steps, is_best=True)
+            print(f"\n✓ Epoch {epoch+1} terminé:")
+            print(f"  Loss moyenne: {avg_loss:.4f}")
+            print(f"  Accuracy moyenne: {avg_acc:.2%}")
         
         # Sauvegarde finale
-        self._save_final_model()
+        self._save_checkpoint(epoch, global_step, is_final=True)
         
         print("\n" + "="*70)
-        print("✅ ENTRAÎNEMENT RLHF TERMINÉ")
+        print("✅ ENTRAÎNEMENT DPO TERMINÉ")
         print("="*70)
-        print(f"🎯 Meilleure récompense moyenne: {best_avg_reward:.4f}")
+        print(f"🎯 Meilleure accuracy validation: {best_val_accuracy:.2%}")
         print(f"💾 Modèle sauvegardé: {self.config.output_dir}")
         print("="*70 + "\n")
     
-    def _save_checkpoint(self, epoch: int, step: int, is_best: bool = False):
+    @torch.no_grad()
+    def _evaluate(self, val_loader: DataLoader) -> Dict:
+        """Évalue le modèle"""
+        self.policy_model.eval()
+        
+        total_loss = 0.0
+        total_accuracy = 0.0
+        num_batches = 0
+        
+        for batch in tqdm(val_loader, desc="Validation"):
+            loss, metrics = self.train_step(batch)
+            total_loss += loss.item()
+            total_accuracy += metrics['accuracy']
+            num_batches += 1
+        
+        avg_metrics = {
+            'loss': total_loss / num_batches,
+            'accuracy': total_accuracy / num_batches
+        }
+        
+        print(f"\n📊 Validation: Loss={avg_metrics['loss']:.4f}, "
+              f"Accuracy={avg_metrics['accuracy']:.2%}")
+        
+        return avg_metrics
+    
+    def _save_checkpoint(
+        self,
+        epoch: int,
+        step: int,
+        is_best: bool = False,
+        is_final: bool = False
+    ):
         """Sauvegarde un checkpoint"""
-        suffix = "best" if is_best else f"epoch{epoch}_step{step}"
+        if is_final:
+            suffix = "final"
+        elif is_best:
+            suffix = "best"
+        else:
+            suffix = f"epoch{epoch}_step{step}"
+        
         checkpoint_dir = Path(self.config.output_dir) / f"checkpoint_{suffix}"
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
-        # Sauvegarder le modèle
-        model_path = checkpoint_dir / "model.pt"
-        torch.save(self.base_model.state_dict(), model_path)
+        # Sauvegarder policy model
+        torch.save(
+            self.policy_model.state_dict(),
+            checkpoint_dir / "model.pt"
+        )
         
         # Sauvegarder config
-        config_path = checkpoint_dir / "config.json"
-        with open(config_path, 'w') as f:
+        with open(checkpoint_dir / "dpo_config.json", 'w') as f:
             json.dump(asdict(self.config), f, indent=2)
         
         self.logger.info(f"💾 Checkpoint sauvegardé: {checkpoint_dir}")
+
+
+# ============================================================================
+# FONCTION D'ENTRAÎNEMENT RAPIDE
+# ============================================================================
+
+def train_with_dpo(
+    model,
+    tokenizer,
+    device: torch.device,
+    config: Optional[DPOConfig] = None,
+    model_dir: Optional[str] = None
+):
+    """
+    Fonction wrapper pour lancer DPO facilement
     
-    def _save_final_model(self):
-        """Sauvegarde le modèle final"""
-        final_dir = Path(self.config.output_dir) / "final"
-        final_dir.mkdir(parents=True, exist_ok=True)
+    Usage:
+        from rlhf_dpo_module import train_with_dpo, DPOConfig
         
-        model_path = final_dir / "model.pt"
-        torch.save(self.base_model.state_dict(), model_path)
+        config = DPOConfig(
+            beta=0.1,
+            learning_rate=5e-7,
+            num_epochs=1
+        )
         
-        self.logger.info(f"✅ Modèle final sauvegardé: {final_dir}")
+        train_with_dpo(model, tokenizer, device, config)
+    """
+    if config is None:
+        config = DPOConfig()
+    
+    trainer = DPOTrainer(
+        model=model,
+        tokenizer=tokenizer,
+        device=device,
+        config=config,
+        model_dir=model_dir
+    )
+    
+    trainer.train()
+    
+    return trainer

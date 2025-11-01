@@ -1,12 +1,12 @@
 """
-Système d'entraînement avec OASST1/2 + Instruction Tuning + RLHF
-Sources : OASST1 + OASST2 (dialogues Hugging Face) + RLHF (Anthropic/hh-rlhf)
+Système d'entraînement avec OASST1/2 + Instruction Tuning + DPO
+Sources : OASST1 + OASST2 (dialogues Hugging Face) + DPO (Anthropic/hh-rlhf)
 
 TOKENIZERS OPEN-SOURCE SUPPORTÉS (32k-50k vocab):
+- mistralai/Mistral-7B-v0.1: 32,000 tokens (RECOMMANDÉ, NON-GATED)
 - gpt2: 50,257 tokens (OpenAI, complètement open-source)
-- mistralai/Mistral-7B-v0.1: 32,000 tokens (NON-GATED)
-- meta-llama/Llama-3.2-1B: 128,256 tokens (NON-GATED, plus récent)
 - EleutherAI/gpt-neox-20b: 50,432 tokens (open-source)
+- meta-llama/Llama-3.2-1B: 128,256 tokens (NON-GATED)
 """
 
 import os
@@ -25,12 +25,19 @@ from torch.optim import AdamW
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from Model.HessGPT import HessGPT
+
+# Import des modules modernisés (noms originaux gardés)
 from utils.instruction_tuning import (
-    InstructionTemplates,
+    ModernInstructionTemplates,
+    InstructionDataFormatter,
     convert_to_instruction_format,
     InstructionDatasetLoader
 )
-from utils.rlhf_module import RLHFTrainer, RLHFConfig
+from utils.rlhf_module import (
+    DPOTrainer,
+    DPOConfig,
+    train_with_dpo
+)
 
 try:
     from datasets import load_dataset
@@ -47,29 +54,32 @@ except ImportError:
 # TOKENIZERS OPEN-SOURCE RECOMMANDÉS (32k-50k vocab, NON-GATED)
 # =============================================================================
 RECOMMENDED_TOKENIZERS = {
+    "mistralai/Mistral-7B-v0.1": {
+        "vocab_size": 32000,
+        "description": "Mistral 7B (32k vocab, NON-GATED) - RECOMMANDÉ",
+        "gated": False,
+        "template": "mistral"  # Template par défaut
+    },
     "gpt2": {
         "vocab_size": 50257,
         "description": "GPT-2 OpenAI (50k vocab, totalement open-source)",
-        "gated": False
-    },
-    "mistralai/Mistral-7B-v0.1": {
-        "vocab_size": 32000,
-        "description": "Mistral 7B (32k vocab, NON-GATED)",
-        "gated": False
+        "gated": False,
+        "template": "chat_simple"
     },
     "EleutherAI/gpt-neox-20b": {
         "vocab_size": 50432,
         "description": "GPT-NeoX (50k vocab, EleutherAI open-source)",
-        "gated": False
+        "gated": False,
+        "template": "chat_simple"
     },
     "meta-llama/Llama-3.2-1B": {
         "vocab_size": 128256,
-        "description": "Llama 3.2 (128k vocab, NON-GATED, plus récent)",
-        "gated": False
+        "description": "Llama 3.2 (128k vocab, NON-GATED)",
+        "gated": False,
+        "template": "llama3"
     }
 }
 
-# Tokenizer par défaut (le plus safe et performant pour 32k-50k)
 DEFAULT_TOKENIZER = "mistralai/Mistral-7B-v0.1"
 
 
@@ -82,6 +92,7 @@ def print_available_tokenizers():
         print(f"\n🔹 {name}")
         print(f"   Vocab: {info['vocab_size']:,} tokens")
         print(f"   {info['description']}")
+        print(f"   Template: {info['template']}")
         print(f"   Gated: {'❌ OUI' if info['gated'] else '✅ NON'}")
     print("\n" + "="*70)
     print(f"💡 Par défaut: {DEFAULT_TOKENIZER}")
@@ -102,12 +113,10 @@ def load_hf_tokenizer(tokenizer_name=None, use_fast=True):
     if not HF_AVAILABLE:
         raise ImportError("Installez transformers: pip install transformers")
     
-    # Utiliser le tokenizer par défaut si non spécifié
     if tokenizer_name is None:
         tokenizer_name = DEFAULT_TOKENIZER
         print(f"ℹ️  Utilisation du tokenizer par défaut: {tokenizer_name}")
     
-    # Vérifier si le tokenizer est dans nos recommandations
     if tokenizer_name not in RECOMMENDED_TOKENIZERS:
         print(f"⚠️  ATTENTION: '{tokenizer_name}' n'est pas dans la liste recommandée")
         print_available_tokenizers()
@@ -138,7 +147,7 @@ def load_hf_tokenizer(tokenizer_name=None, use_fast=True):
         else:
             raise
     
-    # Assurer la compatibilité avec le code existant
+    # Wrapper pour compatibilité MYBPE
     if not hasattr(tokenizer, 'encoder'):
         def encoder_wrapper(text):
             return tokenizer.encode(text, add_special_tokens=False)
@@ -149,7 +158,6 @@ def load_hf_tokenizer(tokenizer_name=None, use_fast=True):
             return tokenizer.decode(ids, skip_special_tokens=False)
         tokenizer.decoder = decoder_wrapper
     
-    # Définir les tokens spéciaux si manquants
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
@@ -160,7 +168,6 @@ def load_hf_tokenizer(tokenizer_name=None, use_fast=True):
     if tokenizer.bos_token:
         print(f"   - BOS: {tokenizer.bos_token} (ID: {tokenizer.bos_token_id})")
     
-    # Vérifier la plage de vocab
     if vocab_size < 30000:
         print(f"⚠️  Vocab size ({vocab_size:,}) < 30k - Performance sous-optimale")
     elif 30000 <= vocab_size <= 60000:
@@ -169,6 +176,22 @@ def load_hf_tokenizer(tokenizer_name=None, use_fast=True):
         print(f"ℹ️  Vocab size élevé ({vocab_size:,}) - Mémoire accrue")
     
     return tokenizer
+
+
+def get_recommended_template(tokenizer_name: str) -> str:
+    """Retourne le template recommandé pour un tokenizer"""
+    if tokenizer_name in RECOMMENDED_TOKENIZERS:
+        return RECOMMENDED_TOKENIZERS[tokenizer_name]["template"]
+    
+    # Fallback basé sur le nom
+    if "llama-3" in tokenizer_name.lower():
+        return "llama3"
+    elif "mistral" in tokenizer_name.lower():
+        return "mistral"
+    elif "zephyr" in tokenizer_name.lower():
+        return "zephyr"
+    else:
+        return "chatml"  # ChatML est le plus standard
 
 
 class OASSTDialogueLoader:
@@ -191,7 +214,7 @@ class OASSTDialogueLoader:
         try:
             if self.version == 'oasst1':
                 dataset_name = "OpenAssistant/oasst1"
-            else:  # oasst2
+            else:
                 dataset_name = "OpenAssistant/oasst2"
 
             self.dataset = load_dataset(dataset_name, split="train")
@@ -241,7 +264,7 @@ class OASSTDialogueLoader:
         return dialogues
 
     def _get_fallback_dialogues(self) -> List[Dict]:
-        """Dialogues de fallback si le dataset n'est pas disponible"""
+        """Dialogues de fallback"""
         fallback = [
             ("Hello", "Hello! How can I help you today?"),
             ("What is machine learning?", "Machine learning is a branch of AI that enables systems to learn from data."),
@@ -251,9 +274,9 @@ class OASSTDialogueLoader:
 
 
 class InstructionTunedDataset(Dataset):
-    """Dataset avec instruction tuning appliqué"""
+    """Dataset avec instruction tuning moderne"""
 
-    def __init__(self, pairs, tokenizer, max_length=512, instruction_template="chat_bot"):
+    def __init__(self, pairs, tokenizer, max_length=512, instruction_template="chatml"):
         self.pairs = pairs
         self.tokenizer = tokenizer
         self.max_length = max_length
@@ -274,23 +297,19 @@ class InstructionTunedDataset(Dataset):
         h = self.pairs[idx]['human'].strip()
         a = self.pairs[idx]['assistant'].strip()
 
-        prefix = f"Human: {h}\nBot:"
-        
+        # Pour calculer où commence la réponse de l'assistant
+        # On encode le texte complet
         if hasattr(self.tokenizer, 'encode'):
-            ids_prefix = self.tokenizer.encode(prefix, add_special_tokens=False)
             ids_all = self.tokenizer.encode(formatted_text, add_special_tokens=False)
+            ids_assistant = self.tokenizer.encode(a, add_special_tokens=False)
         else:
-            ids_prefix = self.tokenizer.encoder(prefix)
             ids_all = self.tokenizer.encoder(formatted_text)
+            ids_assistant = self.tokenizer.encoder(a)
 
         if len(ids_all) > self.max_length:
             ids_all = ids_all[-self.max_length:]
 
-        if hasattr(self.tokenizer, 'encode'):
-            ids_assistant = self.tokenizer.encode(a, add_special_tokens=False)
-        else:
-            ids_assistant = self.tokenizer.encoder(a)
-        
+        # Calculer assist_start (approximation)
         assist_start = max(0, len(ids_all) - len(ids_assistant))
         
         return {
@@ -320,22 +339,29 @@ def collate_fn(batch, pad_id=0):
 
 
 class OASSTTrainer:
-    """Trainer utilisant OASST1/2 + Instruction Tuning + RLHF"""
+    """Trainer utilisant OASST1/2 + Instruction Tuning + DPO"""
 
     def __init__(
         self,
         model_dir,
-        tokenizer_name=None,  # None = utilise DEFAULT_TOKENIZER
+        tokenizer_name=None,
         device=None,
         language='en',
-        instruction_template="chat_bot",
+        instruction_template=None,  # Auto-détecté si None
         custom_data_dir=None
     ):
         self.model_dir = model_dir
         self.tokenizer_name = tokenizer_name or DEFAULT_TOKENIZER
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.language = language
-        self.instruction_template = instruction_template
+        
+        # Auto-détecter le template si non spécifié
+        if instruction_template is None:
+            self.instruction_template = get_recommended_template(self.tokenizer_name)
+            print(f"🎯 Template auto-détecté: {self.instruction_template}")
+        else:
+            self.instruction_template = instruction_template
+        
         self.custom_data_dir = custom_data_dir or os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             'data'
@@ -348,7 +374,9 @@ class OASSTTrainer:
         self.history_file = os.path.join(model_dir, "training_history.json")
         self.history = self._load_history()
 
-        print(f"\n✅ Trainer initialisé avec instruction tuning (template: {instruction_template})")
+        print(f"\n✅ Trainer initialisé")
+        print(f"   Tokenizer: {self.tokenizer_name}")
+        print(f"   Template: {self.instruction_template}")
 
     def _load_or_init_model(self):
         cfg_path = os.path.join(self.model_dir, "config.json")
@@ -408,7 +436,7 @@ class OASSTTrainer:
             "cycles": [],
             "total_examples_trained": 0,
             "instruction_template_used": self.instruction_template,
-            "rlhf_cycles": 0,
+            "dpo_cycles": 0,
             "tokenizer_name": self.tokenizer_name
         }
 
@@ -417,7 +445,7 @@ class OASSTTrainer:
             json.dump(self.history, f, indent=2)
 
     def load_custom_data(self) -> List[Dict]:
-        """Charge les données personnalisées depuis data/"""
+        """Charge les données personnalisées"""
         custom_data = []
 
         if not os.path.exists(self.custom_data_dir):
@@ -447,7 +475,7 @@ class OASSTTrainer:
         num_oasst2=500,
         repeat_important=3
     ):
-        """Génère le dataset depuis OASST1 et OASST2 (anglais)"""
+        """Génère le dataset depuis OASST1 et OASST2"""
         print("\n" + "="*60)
         print("🔄 GÉNÉRATION DATASET OASST1/2 (ENGLISH)")
         print("="*60)
@@ -474,7 +502,7 @@ class OASSTTrainer:
         print(f"✅ DATASET TOTAL: {len(dataset)} exemples")
         print(f"   - OASST1: {len(dialogues1) * repeat_important}")
         print(f"   - OASST2: {len(dialogues2) * repeat_important}")
-        print(f"🎯 Instruction Template: {self.instruction_template}")
+        print(f"🎯 Template: {self.instruction_template}")
         print(f"🔤 Tokenizer: {self.tokenizer_name} ({len(self.tokenizer):,} tokens)")
         print("="*60)
 
@@ -482,9 +510,9 @@ class OASSTTrainer:
 
     def train_one_cycle(
         self,
-        num_oasst1=500,
-        num_oasst2=500,
-        epochs=3,
+        num_oasst1=1000,
+        num_oasst2=1000,
+        epochs=5,
         batch_size=8,
         lr=5e-5
     ):
@@ -580,51 +608,54 @@ class OASSTTrainer:
         print(f"   Total exemples: {self.history['total_examples_trained']}")
         print("="*70)
 
-    def train_with_rlhf(
+    def train_with_dpo(
         self,
         max_samples=5000,
         epochs=1,
         batch_size=4,
-        lr=1.41e-5
+        lr=5e-7,
+        beta=0.1
     ):
-        """Entraînement RLHF après le supervisé"""
+        """Entraînement DPO (Direct Preference Optimization)"""
         print("\n" + "="*70)
-        print("🎯 LANCEMENT ENTRAÎNEMENT RLHF")
+        print("🎯 LANCEMENT ENTRAÎNEMENT DPO")
+        print("   (Direct Preference Optimization - Alternative moderne au RLHF)")
         print("="*70)
 
-        rlhf_config = RLHFConfig(
+        dpo_config = DPOConfig(
             dataset_name="Anthropic/hh-rlhf",
             max_samples_train=max_samples,
             max_samples_val=int(max_samples * 0.1),
+            beta=beta,
             batch_size=batch_size,
-            mini_batch_size=max(1, batch_size // 4),
-            num_train_epochs=epochs,
+            num_epochs=epochs,
             learning_rate=lr,
-            output_dir=os.path.join(self.model_dir, "rlhf_output")
+            output_dir=os.path.join(self.model_dir, "dpo_output"),
+            max_prompt_length=256,
+            max_response_length=256
         )
 
-        rlhf_trainer = RLHFTrainer(
-            base_model=self.model,
+        # Utiliser la fonction wrapper
+        train_with_dpo(
+            model=self.model,
             tokenizer=self.tokenizer,
             device=self.device,
-            rlhf_config=rlhf_config,
+            config=dpo_config,
             model_dir=self.model_dir
         )
 
-        rlhf_trainer.train_with_rlhf()
-
-        self.history["rlhf_cycles"] += 1
+        self.history["dpo_cycles"] += 1
         self._save_history()
 
-        print(f"\n✅ RLHF terminé ({self.history['rlhf_cycles']} cycles)")
+        print(f"\n✅ DPO terminé ({self.history['dpo_cycles']} cycles)")
 
 
 def main():
     print("\n" + "="*70)
-    print("🤖 SYSTÈME D'ENTRAÎNEMENT OASST1/2 + RLHF + INSTRUCTION TUNING")
+    print("🤖 SYSTÈME D'ENTRAÎNEMENT MODERNE")
+    print("   OASST1/2 + Instruction Tuning + DPO")
     print("="*70)
     
-    # Afficher les tokenizers disponibles
     print_available_tokenizers()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -637,36 +668,38 @@ def main():
     )
     print(f"📁 Model directory: {model_dir}")
 
-    # OPTION 1: Mistral 7B (32k vocab, NON-GATED, recommandé)
+    # CHOIX DU TOKENIZER
+    # Option 1: Mistral (32k vocab, RECOMMANDÉ)
     tokenizer_name = "mistralai/Mistral-7B-v0.1"
     
-    # OPTION 2: GPT-2 (50k vocab, totalement open-source)
+    # Option 2: GPT-2 (50k vocab)
     # tokenizer_name = "gpt2"
     
-    # OPTION 3: GPT-NeoX (50k vocab, EleutherAI)
+    # Option 3: GPT-NeoX (50k vocab)
     # tokenizer_name = "EleutherAI/gpt-neox-20b"
     
-    # OPTION 4: Llama 3.2 (128k vocab, NON-GATED, plus récent)
+    # Option 4: Llama 3.2 (128k vocab)
     # tokenizer_name = "meta-llama/Llama-3.2-1B"
-    
-    # OPTION 5: Laisser None pour utiliser DEFAULT_TOKENIZER
-    # tokenizer_name = None
 
-    print(f"🔤 Tokenizer choisi: {tokenizer_name or DEFAULT_TOKENIZER}")
+    print(f"🔤 Tokenizer choisi: {tokenizer_name}")
 
+    # Le template sera auto-détecté selon le tokenizer
     trainer = OASSTTrainer(
         model_dir=model_dir,
         tokenizer_name=tokenizer_name,
         device=device,
         language='en',
-        instruction_template="chat_bot"
+        instruction_template=None  # Auto-détection
     )
 
-    print("\n🎯 Phase 1: Entraînement supervisé (OASST1/2)")
+    print("\n" + "="*70)
+    print("🎯 PHASE 1: Entraînement Supervisé (OASST1/2)")
+    print("="*70)
     print("   - 500 dialogues OASST1 (English)")
     print("   - 500 dialogues OASST2 (English)")
     print("   - 3 époques")
-    print(f"   - Tokenizer: {tokenizer_name or DEFAULT_TOKENIZER}")
+    print(f"   - Tokenizer: {tokenizer_name}")
+    print(f"   - Template: {trainer.instruction_template}")
 
     trainer.train_one_cycle(
         num_oasst1=500,
@@ -676,18 +709,32 @@ def main():
         lr=5e-5
     )
 
-    print("\n🎯 Phase 2: RLHF (Anthropic/hh-rlhf)")
+    print("\n" + "="*70)
+    print("🎯 PHASE 2: DPO (Anthropic/hh-rlhf)")
+    print("="*70)
     print("   - 5000 samples")
     print("   - 1 époque")
+    print("   - Beta (KL coef): 0.1")
+    print("   - Algorithm: Direct Preference Optimization")
 
-    trainer.train_with_rlhf(
-        max_samples=5000,
+    trainer.train_with_dpo(
+        max_samples=100,
         epochs=1,
-        batch_size=4,
-        lr=1.41e-5
+        batch_size=1,
+        lr=5e-7,
+        beta=0.1
     )
 
-    print("\n✅ Entraînement complet terminé!")
+    print("\n" + "="*70)
+    print("✅ ENTRAÎNEMENT COMPLET TERMINÉ!")
+    print("="*70)
+    print(f"📊 Statistiques finales:")
+    print(f"   - Cycles supervisés: {len(trainer.history['cycles'])}")
+    print(f"   - Cycles DPO: {trainer.history['dpo_cycles']}")
+    print(f"   - Total exemples: {trainer.history['total_examples_trained']}")
+    print(f"   - Tokenizer: {tokenizer_name}")
+    print(f"   - Template: {trainer.instruction_template}")
+    print("="*70)
 
 
 if __name__ == "__main__":
