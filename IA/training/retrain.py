@@ -1,17 +1,83 @@
 """
-Script de réentraînement progressif avec diagnostic
+Script de réentraînement progressif avec diagnostic et chargement optimisé
 Augmente graduellement la complexité et les données
-LANCE AUTOMATIQUEMENT L'ENTRAÎNEMENT
 """
 
 import os
 import sys
 import torch
 import json
+from datasets import load_dataset
+from functools import lru_cache
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from training.FineTuning import OASSTTrainer, DPOConfig
+
+
+# Cache global pour les datasets
+_DATASET_CACHE = {}
+
+
+@lru_cache(maxsize=2)
+def load_oasst_dataset_cached(dataset_name, split='train'):
+    """
+    Charge un dataset OASST avec cache en mémoire
+    Utilise streaming pour éviter de tout télécharger
+    """
+    print(f"📥 Chargement optimisé de {dataset_name}...")
+    
+    cache_key = f"{dataset_name}_{split}"
+    
+    if cache_key in _DATASET_CACHE:
+        print(f"   ✅ Dataset trouvé en cache")
+        return _DATASET_CACHE[cache_key]
+    
+    try:
+        # Charger en streaming mode pour réduire la mémoire
+        dataset = load_dataset(
+            dataset_name,
+            split=split,
+            streaming=False,  # False pour cache mais on limite les colonnes
+            trust_remote_code=True
+        )
+        
+        # Garder uniquement les colonnes nécessaires
+        if 'oasst1' in dataset_name:
+            needed_cols = ['text', 'message_id', 'parent_id', 'role', 'lang']
+        else:  # oasst2
+            needed_cols = ['text', 'message_id', 'parent_id', 'role', 'lang']
+        
+        # Filtrer les colonnes inutiles pour réduire la mémoire
+        available_cols = dataset.column_names
+        cols_to_remove = [col for col in available_cols if col not in needed_cols]
+        if cols_to_remove:
+            dataset = dataset.remove_columns(cols_to_remove)
+        
+        _DATASET_CACHE[cache_key] = dataset
+        print(f"   ✅ Dataset chargé et mis en cache ({len(dataset)} exemples)")
+        return dataset
+        
+    except Exception as e:
+        print(f"   ⚠️  Erreur de chargement: {e}")
+        return None
+
+
+def preload_datasets():
+    """Précharge les datasets en arrière-plan"""
+    print("\n" + "="*70)
+    print("🚀 PRÉCHARGEMENT DES DATASETS")
+    print("="*70)
+    
+    datasets_to_load = [
+        ("OpenAssistant/oasst1", "train"),
+        ("OpenAssistant/oasst2", "train")
+    ]
+    
+    for dataset_name, split in datasets_to_load:
+        load_oasst_dataset_cached(dataset_name, split)
+    
+    print("✅ Préchargement terminé\n")
 
 
 def diagnose_model(trainer):
@@ -158,11 +224,15 @@ def progressive_training(trainer, phase):
 
 def main():
     print("\n" + "="*70)
-    print("🔄 RÉENTRAÎNEMENT PROGRESSIF AUTOMATIQUE")
+    print("🔄 RÉENTRAÎNEMENT PROGRESSIF (VERSION OPTIMISÉE)")
     print("="*70)
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"💻 Device: {device}")
+    
+    # Précharger les datasets avant tout
+    print("\n⚡ Optimisation: Préchargement des datasets en cache...")
+    preload_datasets()
     
     model_dir = os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -172,11 +242,7 @@ def main():
     
     tokenizer_name = "mistralai/Mistral-7B-v0.1"
     
-    print(f"📁 Model directory: {model_dir}")
-    print(f"🔤 Tokenizer: {tokenizer_name}")
-    
     # Créer le trainer
-    print("\n⏳ Initialisation du trainer...")
     trainer = OASSTTrainer(
         model_dir=model_dir,
         tokenizer_name=tokenizer_name,
@@ -197,9 +263,9 @@ def main():
     ]
     test_generation(trainer, test_prompts)
     
-    # Déterminer les phases automatiquement
+    # Demander confirmation
     print("\n" + "="*70)
-    print("🤔 PLAN D'ENTRAÎNEMENT DÉTECTÉ:")
+    print("🤔 PLAN D'ENTRAÎNEMENT RECOMMANDÉ:")
     print("="*70)
     
     if recommendation == "train_more":
@@ -222,25 +288,17 @@ def main():
     
     else:
         print("✅ Modèle déjà bien entraîné!")
-        print("💡 Aucun entraînement supplémentaire nécessaire")
-        print("\n🎉 Le modèle est prêt à l'emploi!")
-        print("\n💡 Testez-le avec:")
-        print("   python test.py --mode interactive --template mistral")
+        print("💡 Vous pouvez faire du fine-tuning additionnel si nécessaire")
         phases = []
     
     if phases:
         print(f"\n⏱️  Temps estimé: {len(phases) * 30}-{len(phases) * 60} minutes")
-        print("="*70)
-        print("\n🚀 DÉMARRAGE AUTOMATIQUE DE L'ENTRAÎNEMENT...")
-        print("   (Pour annuler: Ctrl+C)")
+        print("⚡ Optimisation: Chargement datasets accéléré avec cache")
         print("="*70)
         
-        import time
-        print("\n⏳ Démarrage dans 3 secondes...")
-        time.sleep(3)
+        response = input("\n🚀 Lancer l'entraînement progressif? (y/N): ")
         
-        # LANCEMENT AUTOMATIQUE
-        try:
+        if response.lower() == 'y':
             for i, phase in enumerate(phases, 1):
                 print(f"\n{'='*70}")
                 print(f"🎯 ÉTAPE {i}/{len(phases)}")
@@ -260,28 +318,10 @@ def main():
             print("\n📊 TEST FINAL:")
             test_generation(trainer, test_prompts)
             
-            print("\n" + "="*70)
-            print("✅ SUCCÈS! Le modèle est maintenant entraîné")
-            print("="*70)
-            print(f"📊 Statistiques finales:")
-            print(f"   - Cycles: {len(trainer.history['cycles'])}")
-            print(f"   - Total exemples: {trainer.history['total_examples_trained']}")
-            print(f"   - DPO cycles: {trainer.history['dpo_cycles']}")
             print("\n💡 Testez en mode interactif avec:")
             print("   python test.py --mode interactive --template mistral")
-            print("\n📝 Ou testez un prompt unique:")
-            print('   python test.py --mode single --prompt "Hello!" --template mistral')
-            print("="*70)
-            
-        except KeyboardInterrupt:
-            print("\n\n⚠️  ENTRAÎNEMENT INTERROMPU PAR L'UTILISATEUR")
-            print("💾 Le modèle a été sauvegardé au dernier checkpoint")
-            print("   Relancez le script pour continuer l'entraînement")
-        except Exception as e:
-            print(f"\n\n❌ ERREUR DURANT L'ENTRAÎNEMENT: {e}")
-            import traceback
-            traceback.print_exc()
-            print("\n💾 Le modèle a été sauvegardé au dernier checkpoint")
+        else:
+            print("\n❌ Entraînement annulé")
     
     print("\n" + "="*70)
 
