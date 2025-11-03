@@ -250,6 +250,9 @@ class QwenChatbotTrainer:
         if config.use_lora:
             print("⚡ Application de LoRA...")
             self.model = self._apply_lora()
+            
+            # IMPORTANT: S'assurer que le modèle est en mode training
+            self.model.train()
         
         print(f"✅ Modèle chargé!")
         
@@ -280,7 +283,16 @@ class QwenChatbotTrainer:
             task_type="CAUSAL_LM"
         )
         
+        # Appliquer LoRA
         model = get_peft_model(self.model, lora_config)
+        
+        # S'assurer que les paramètres LoRA sont entraînables
+        model.print_trainable_parameters()
+        
+        # Forcer l'activation des gradients pour les paramètres LoRA
+        for name, param in model.named_parameters():
+            if 'lora' in name.lower():
+                param.requires_grad = True
         
         return model
     
@@ -327,7 +339,7 @@ class QwenChatbotTrainer:
             save_total_limit=3,
             report_to="wandb" if self.config.use_wandb else "none",
             remove_unused_columns=False,
-            gradient_checkpointing=True,
+            gradient_checkpointing=False,  # Désactiver gradient checkpointing avec LoRA
             fp16=(self.device == "cuda"),
         )
         
